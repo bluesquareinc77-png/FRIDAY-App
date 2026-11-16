@@ -1,22 +1,20 @@
 package com.friday.assistant
 
 import android.Manifest
-import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
+import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -50,14 +48,19 @@ data class ChatItem(val sender: String, val text: String, val time: String)
 class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var tts: TextToSpeech? = null
     private var ttsReady = false
+    private var speechRecognizer: SpeechRecognizer? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         tts = TextToSpeech(this, this)
+        if (SpeechRecognizer.isRecognitionAvailable(this)) {
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        }
         setContent {
-            FridayHudApp(onSpeak = { text, enabled ->
-                if (enabled) speakOut(text)
-            })
+            FridayHudApp(
+                speechRecognizer = speechRecognizer,
+                onSpeak = { text, enabled -> if (enabled) speakOut(text) }
+            )
         }
     }
 
@@ -81,6 +84,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     }
 
     override fun onDestroy() {
+        speechRecognizer?.destroy()
         tts?.stop()
         tts?.shutdown()
         super.onDestroy()
@@ -88,7 +92,10 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 }
 
 @Composable
-fun FridayHudApp(onSpeak: (String, Boolean) -> Unit) {
+fun FridayHudApp(
+    speechRecognizer: SpeechRecognizer?,
+    onSpeak: (String, Boolean) -> Unit
+) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("friday_prefs", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
@@ -97,16 +104,18 @@ fun FridayHudApp(onSpeak: (String, Boolean) -> Unit) {
     var apiKey by remember { mutableStateOf(prefs.getString("gemini_api_key", "") ?: "") }
     var showKeyDialog by remember { mutableStateOf(false) }
     var voiceEnabled by remember { mutableStateOf(true) }
-    var micLang by remember { mutableStateOf("en-IN") }
+    var micLang by remember { mutableStateOf(prefs.getString("mic_lang", "en-IN") ?: "en-IN") }
     var inputText by remember { mutableStateOf("") }
     var statusText by remember { mutableStateOf("F.R.I.D.A.Y. ONLINE") }
     var liveClock by remember { mutableStateOf("00:00:00") }
+    var isListening by remember { mutableStateOf(false) }
+    var livePartial by remember { mutableStateOf("") }
 
     val messages = remember {
         mutableStateListOf(
             ChatItem(
                 "F.R.I.D.A.Y.",
-                "Systems online, Boss. Tap the Mic or type commands like 'Call Mom', 'Open YouTube', 'Flashlight on', or ask anything.",
+                "Siri Mode Ready, Boss. Tap the core to speak directly without popups, or set me as your phone's Default Assistant!",
                 SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
             )
         )
@@ -154,33 +163,60 @@ fun FridayHudApp(onSpeak: (String, Boolean) -> Unit) {
         }
     }
 
-    val micLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            val spoken = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
-            if (!spoken.isNullOrBlank()) sendCommand(spoken)
+    fun toggleInlineMic() {
+        if (speechRecognizer == null) {
+            messages.add(ChatItem("F.R.I.D.A.Y.", "Inline speech service unavailable on this device.", liveClock))
+            return
         }
-    }
+        if (isListening) {
+            speechRecognizer.stopListening()
+            isListening = false
+            statusText = "F.R.I.D.A.Y. ONLINE"
+            return
+        }
+        livePartial = ""
+        statusText = "LISTENING..."
+        isListening = true
 
-    fun launchMic() {
+        speechRecognizer.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) { isListening = true }
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() { isListening = false }
+            override fun onError(error: Int) {
+                isListening = false
+                livePartial = ""
+                statusText = "F.R.I.D.A.Y. ONLINE"
+            }
+            override fun onPartialResults(partialResults: Bundle?) {
+                val p = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                if (!p.isNullOrBlank()) livePartial = p
+            }
+            override fun onResults(results: Bundle?) {
+                isListening = false
+                livePartial = ""
+                statusText = "F.R.I.D.A.Y. ONLINE"
+                val spoken = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                if (!spoken.isNullOrBlank()) sendCommand(spoken)
+            }
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        })
+
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, micLang)
-            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to F.R.I.D.A.Y., Boss...")
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
         }
-        try {
-            micLauncher.launch(intent)
-        } catch (_: Exception) {
-            messages.add(ChatItem("F.R.I.D.A.Y.", "Google Voice Search is not available on this device.", liveClock))
-        }
+        speechRecognizer.startListening(intent)
     }
 
     val pulse = rememberInfiniteTransition(label = "arc")
     val scale by pulse.animateFloat(
         initialValue = 0.96f,
-        targetValue = 1.06f,
-        animationSpec = infiniteRepeatable(tween(1800), RepeatMode.Reverse),
+        targetValue = if (isListening) 1.14f else 1.05f,
+        animationSpec = infiniteRepeatable(tween(if (isListening) 500 else 1800), RepeatMode.Reverse),
         label = "scale"
     )
 
@@ -203,31 +239,44 @@ fun FridayHudApp(onSpeak: (String, Boolean) -> Unit) {
         ) {
             Column {
                 Text("F.R.I.D.A.Y.", color = Color(0xFF22D3EE), fontSize = 18.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-                Text("$statusText • $liveClock", color = Color(0xFF34D399), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                Text("$statusText • $liveClock", color = if (isListening) Color(0xFFF43F5E) else Color(0xFF34D399), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 TextButton(onClick = { voiceEnabled = !voiceEnabled }) {
-                    Text(if (voiceEnabled) "🔊 ON" else "🔇 OFF", color = Color(0xFF67E8F9), fontSize = 12.sp)
+                    Text(if (voiceEnabled) "🔊" else "🔇", fontSize = 15.sp)
+                }
+                Button(
+                    onClick = {
+                        try {
+                            context.startActivity(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS))
+                        } catch (_: Exception) {
+                            context.startActivity(Intent(Settings.ACTION_SETTINGS))
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF155E75)),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Text("⚡ SIRI MODE", fontSize = 10.sp, color = Color.White)
                 }
                 Button(
                     onClick = { showKeyDialog = true },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0E7490)),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                 ) {
-                    Text("⚙️ KEY", fontSize = 11.sp, color = Color.White)
+                    Text("⚙️ KEY", fontSize = 10.sp, color = Color.White)
                 }
             }
         }
 
         Spacer(Modifier.height(12.dp))
 
-        // ARC REACTOR CORE + QUICK CHIPS
+        // ARC REACTOR CORE
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(16.dp))
                 .background(Color(0xBB020617))
-                .border(1.dp, Color(0xFF155E75), RoundedCornerShape(16.dp))
+                .border(1.dp, if (isListening) Color(0xFF22D3EE) else Color(0xFF155E75), RoundedCornerShape(16.dp))
                 .padding(14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -236,16 +285,21 @@ fun FridayHudApp(onSpeak: (String, Boolean) -> Unit) {
                     .size(76.dp)
                     .scale(scale)
                     .clip(CircleShape)
-                    .background(Color(0xFF083344))
-                    .border(2.dp, Color(0xFF22D3EE), CircleShape)
-                    .clickable { launchMic() },
+                    .background(if (isListening) Color(0xFF164E63) else Color(0xFF083344))
+                    .border(2.dp, if (isListening) Color(0xFFF43F5E) else Color(0xFF22D3EE), CircleShape)
+                    .clickable { toggleInlineMic() },
                 contentAlignment = Alignment.Center
             ) {
-                Text("🎤", fontSize = 26.sp)
+                Text(if (isListening) "🔴" else "🎤", fontSize = 26.sp)
             }
             Spacer(Modifier.width(14.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text("Tap Reactor to Speak", color = Color(0xFFA5F3FC), fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                Text(
+                    if (isListening) (if (livePartial.isNotEmpty()) livePartial else "Listening inline, Boss...") else "Tap Core to Speak (No Popup)",
+                    color = Color(0xFFA5F3FC),
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp
+                )
                 Spacer(Modifier.height(6.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     listOf("en-IN" to "EN", "gu-IN" to "ગુજ", "hi-IN" to "हिन्दी").forEach { (code, label) ->
@@ -254,7 +308,10 @@ fun FridayHudApp(onSpeak: (String, Boolean) -> Unit) {
                             modifier = Modifier
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(if (active) Color(0xFF06B6D4) else Color(0xFF0F172A))
-                                .clickable { micLang = code }
+                                .clickable {
+                                    micLang = code
+                                    prefs.edit().putString("mic_lang", code).apply()
+                                }
                                 .padding(horizontal = 10.dp, vertical = 5.dp)
                         ) {
                             Text(label, color = if (active) Color.Black else Color(0xFF67E8F9), fontSize = 11.sp, fontWeight = FontWeight.Bold)
