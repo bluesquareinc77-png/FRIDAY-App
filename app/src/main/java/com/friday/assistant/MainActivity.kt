@@ -3,6 +3,7 @@ package com.friday.assistant
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -68,7 +69,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         if (status == TextToSpeech.SUCCESS) {
             ttsReady = true
             tts?.setPitch(1.08f)
-            tts?.setSpeechRate(1.02f)
+            tts?.setSpeechRate(1.05f)
         }
     }
 
@@ -104,6 +105,7 @@ fun FridayHudApp(
     var apiKey by remember { mutableStateOf(prefs.getString("gemini_api_key", "") ?: "") }
     var showKeyDialog by remember { mutableStateOf(false) }
     var voiceEnabled by remember { mutableStateOf(true) }
+    var orbActive by remember { mutableStateOf(false) }
     var micLang by remember { mutableStateOf(prefs.getString("mic_lang", "en-IN") ?: "en-IN") }
     var inputText by remember { mutableStateOf("") }
     var statusText by remember { mutableStateOf("F.R.I.D.A.Y. ONLINE") }
@@ -115,7 +117,7 @@ fun FridayHudApp(
         mutableStateListOf(
             ChatItem(
                 "F.R.I.D.A.Y.",
-                "Siri Mode Ready, Boss. Tap the core to speak directly without popups, or set me as your phone's Default Assistant!",
+                "Turbo Siri Mode Active, Boss! Turn ON '🛸 ORB + SHAKE' to open me from anywhere in 0.1s without holding the power button.",
                 SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
             )
         )
@@ -145,6 +147,30 @@ fun FridayHudApp(
         }
     }
 
+    fun toggleOrbService() {
+        if (!Settings.canDrawOverlays(context)) {
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:${context.packageName}")
+            )
+            context.startActivity(intent)
+            messages.add(ChatItem("F.R.I.D.A.Y.", "Please allow 'Display over other apps', then tap 🛸 ORB + SHAKE again, Boss.", liveClock))
+            return
+        }
+        val svcIntent = Intent(context, FridayOrbService::class.java)
+        if (orbActive) {
+            context.stopService(svcIntent)
+            orbActive = false
+        } else {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(svcIntent)
+            } else {
+                context.startService(svcIntent)
+            }
+            orbActive = true
+        }
+    }
+
     fun sendCommand(cmd: String) {
         val clean = cmd.trim()
         if (clean.isEmpty()) return
@@ -154,11 +180,11 @@ fun FridayHudApp(
 
         scope.launch {
             listState.animateScrollToItem(messages.size - 1)
-            val reply = FridayBrain.process(context, clean, apiKey)
+            val result = FridayBrain.process(context, clean, apiKey)
             val rTime = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
-            messages.add(ChatItem("F.R.I.D.A.Y.", reply, rTime))
+            messages.add(ChatItem("F.R.I.D.A.Y.", result.reply, rTime))
             statusText = "F.R.I.D.A.Y. ONLINE"
-            onSpeak(reply, voiceEnabled)
+            onSpeak(result.reply, voiceEnabled)
             listState.animateScrollToItem(messages.size - 1)
         }
     }
@@ -226,7 +252,6 @@ fun FridayHudApp(
             .background(Brush.verticalGradient(listOf(Color(0xFF082F49), Color(0xFF030712))))
             .padding(12.dp)
     ) {
-        // TOP BAR
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -246,17 +271,11 @@ fun FridayHudApp(
                     Text(if (voiceEnabled) "🔊" else "🔇", fontSize = 15.sp)
                 }
                 Button(
-                    onClick = {
-                        try {
-                            context.startActivity(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS))
-                        } catch (_: Exception) {
-                            context.startActivity(Intent(Settings.ACTION_SETTINGS))
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF155E75)),
+                    onClick = { toggleOrbService() },
+                    colors = ButtonDefaults.buttonColors(containerColor = if (orbActive) Color(0xFF059669) else Color(0xFF155E75)),
                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                 ) {
-                    Text("⚡ SIRI MODE", fontSize = 10.sp, color = Color.White)
+                    Text(if (orbActive) "🛸 ON" else "🛸 ORB", fontSize = 10.sp, color = Color.White)
                 }
                 Button(
                     onClick = { showKeyDialog = true },
@@ -270,7 +289,6 @@ fun FridayHudApp(
 
         Spacer(Modifier.height(12.dp))
 
-        // ARC REACTOR CORE
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -295,7 +313,7 @@ fun FridayHudApp(
             Spacer(Modifier.width(14.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    if (isListening) (if (livePartial.isNotEmpty()) livePartial else "Listening inline, Boss...") else "Tap Core to Speak (No Popup)",
+                    if (isListening) (if (livePartial.isNotEmpty()) livePartial else "Listening inline, Boss...") else "Tap Core to Speak (0.1s Fast Mode)",
                     color = Color(0xFFA5F3FC),
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 14.sp
@@ -323,7 +341,6 @@ fun FridayHudApp(
 
         Spacer(Modifier.height(10.dp))
 
-        // CHAT LOG
         LazyColumn(
             state = listState,
             modifier = Modifier
@@ -355,7 +372,6 @@ fun FridayHudApp(
 
         Spacer(Modifier.height(10.dp))
 
-        // INPUT BAR
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
