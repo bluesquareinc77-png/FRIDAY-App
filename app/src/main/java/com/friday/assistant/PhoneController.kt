@@ -22,44 +22,99 @@ import java.util.Locale
 
 object PhoneController {
 
-    private fun findContactNumber(context: Context, nameQuery: String): Pair<String, String>? {
-        val cleanInput = nameQuery.replace(Regex("[^0-9+]"), "")
-        if (cleanInput.length >= 7 && !nameQuery.any { it.isLetter() }) {
-            return Pair(nameQuery, cleanInput)
+    private data class ContactMatch(val name: String, val number: String, val score: Int)
+
+    private fun findBestContacts(context: Context, nameQuery: String): List<ContactMatch> {
+        val q = nameQuery.trim()
+        val cleanDigits = q.replace(Regex("[^0-9+]"), "")
+        if (cleanDigits.length >= 7 && !q.any { it.isLetter() }) {
+            return listOf(ContactMatch(q, cleanDigits, 100))
         }
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
-            return null
+            return emptyList()
         }
+
         val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
         val projection = arrayOf(
             ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
             ContactsContract.CommonDataKinds.Phone.NUMBER
         )
+
+        val matches = linkedMapOf<String, ContactMatch>()
+        val qLower = q.lowercase()
+        val wordRegex = Regex("\\b${Regex.escape(qLower)}\\b")
+
         context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
             val nameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
             val numIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
             while (cursor.moveToNext()) {
-                val name = cursor.getString(nameIdx) ?: continue
-                val number = cursor.getString(numIdx) ?: continue
-                if (name.contains(nameQuery.trim(), ignoreCase = true)) {
-                    return Pair(name, number.replace(Regex("\\s+"), ""))
+                val name = cursor.getString(nameIdx)?.trim() ?: continue
+                val number = cursor.getString(numIdx)?.replace(Regex("\\s+"), "") ?: continue
+                val nLower = name.lowercase()
+
+                val score = when {
+                    nLower == qLower -> 100                                           // Exact match: "Viraj"
+                    nLower.startsWith("$qLower ") -> 85                               // First word match: "Viraj Patel"
+                    nLower.startsWith(qLower) -> 75                                   // Prefix match: "Virajbhai"
+                    wordRegex.containsMatchIn(nLower) && !nLower.contains("(") -> 50  // Word match outside brackets
+                    nLower.contains(qLower) -> 20                                     // Inside brackets: "Dipakbhai (Viraj na mama)"
+                    else -> 0
+                }
+
+                if (score > 0) {
+                    val key = "${nLower}_$number"
+                    val existing = matches[key]
+                    if (existing == null || score > existing.score) {
+                        matches[key] = ContactMatch(name, number, score)
+                    }
                 }
             }
         }
-        return null
+        return matches.values.sortedByDescending { it.score }
+    }
+
+    private sealed class ContactPick {
+        data class Exact(val name: String, val number: String) : ContactPick()
+        data class Ambiguous(val message: String) : ContactPick()
+        data class NotFound(val message: String) : ContactPick()
+    }
+
+    private fun pickContact(context: Context, query: String): ContactPick {
+        val matches = findBestContacts(context, query)
+        if (matches.isEmpty()) {
+            return ContactPick.NotFound("Sorry Boss, I couldn't find '$query' in your contacts, or contact permission is missing.")
+        }
+
+        val topScore = matches.first().score
+        val topDistinctNames = matches.filter { it.score == topScore }.map { it.name }.distinct()
+
+        return when {
+            topScore < 50 -> {
+                val options = topDistinctNames.take(3).joinToString(", ")
+                ContactPick.Ambiguous("Boss, I didn't find '$query' directly. Did you mean $options? Please say the full name.")
+            }
+            topDistinctNames.size > 1 -> {
+                val options = topDistinctNames.take(4).joinToString(", ")
+                ContactPick.Ambiguous("Boss, I found multiple contacts: $options. Which one should I select?")
+            }
+            else -> ContactPick.Exact(matches.first().name, matches.first().number)
+        }
     }
 
     fun makeCall(context: Context, contactName: String): String {
-        val found = findContactNumber(context, contactName)
-            ?: return "Sorry Boss, I couldn't find '$contactName' in your contacts, or contact permission is missing."
-        val (name, number) = found
-        val hasCallPerm = ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
-        val intent = Intent(if (hasCallPerm) Intent.ACTION_CALL else Intent.ACTION_DIAL).apply {
-            data = Uri.parse("tel:$number")
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        return when (val pick = pickContact(context, contactName)) {
+            is ContactPick.NotFound -> pick.message
+            is ContactPick.Ambiguous -> pick.message
+            is ContactPick.Exact -> {
+                val hasCallPerm = ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
+                val intent = Intent(if (hasCallPerm) Intent.ACTION_CALL else Intent.ACTION_DIAL).apply {
+                    data = Uri.parse("tel:${pick.number}")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+                if (hasCallPerm) "Calling ${pick.name} right now, Boss." else "Opening dialer for ${pick.name}, Boss."
+            }
         }
-        context.startActivity(intent)
-        return if (hasCallPerm) "Calling $name right now, Boss." else "Opening dialer for $name, Boss."
     }
 
     fun openApp(context: Context, appName: String): String {
@@ -94,21 +149,24 @@ object PhoneController {
     }
 
     fun sendWhatsApp(context: Context, contactName: String, message: String): String {
-        val found = findContactNumber(context, contactName)
-            ?: return "I couldn't find '$contactName' in your contacts to message on WhatsApp, Boss."
-        val (name, rawNumber) = found
-        var digits = rawNumber.replace(Regex("[^0-9]"), "")
-        if (digits.length == 10) digits = "91$digits"
+        return when (val pick = pickContact(context, contactName)) {
+            is ContactPick.NotFound -> pick.message
+            is ContactPick.Ambiguous -> pick.message
+            is ContactPick.Exact -> {
+                var digits = pick.number.replace(Regex("[^0-9]"), "")
+                if (digits.length == 10) digits = "91$digits"
 
-        val url = "https://wa.me/$digits?text=${Uri.encode(message)}"
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        return try {
-            context.startActivity(intent)
-            "Opening WhatsApp chat with $name with your message ready, Boss."
-        } catch (_: Exception) {
-            "WhatsApp is not installed on this device, Boss."
+                val url = "https://wa.me/$digits?text=${Uri.encode(message)}"
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                try {
+                    context.startActivity(intent)
+                    "Opening WhatsApp chat with ${pick.name} with your message ready, Boss."
+                } catch (_: Exception) {
+                    "WhatsApp is not installed on this device, Boss."
+                }
+            }
         }
     }
 
