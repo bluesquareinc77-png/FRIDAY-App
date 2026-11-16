@@ -16,6 +16,18 @@ object FridayBrain {
     private const val MODEL_URL =
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent"
 
+    private val history = mutableListOf<JSONObject>()
+
+    private fun addToHistory(role: String, text: String) {
+        synchronized(history) {
+            history.add(JSONObject().apply {
+                put("role", role)
+                put("parts", JSONArray().put(JSONObject().put("text", text)))
+            })
+            while (history.size > 8) history.removeAt(0)
+        }
+    }
+
     suspend fun process(context: Context, userInput: String, apiKey: String): String = withContext(Dispatchers.IO) {
         val lower = userInput.lowercase().trim()
 
@@ -24,17 +36,21 @@ object FridayBrain {
         }
 
         try {
-            val payload = buildToolPayload(userInput)
+            addToHistory("user", userInput)
+            val payload = buildToolPayload()
             val resJson = postGemini(apiKey.trim(), payload)
 
             if (resJson.has("error")) {
                 val msg = resJson.getJSONObject("error").optString("message", "API Error")
-                return@withContext "API Notice: $msg. You can check your key in Settings, Boss."
+                return@withContext "API Notice: $msg. Check your key in Settings, Boss."
             }
 
             val candidates = resJson.optJSONArray("candidates") ?: return@withContext "No response, Boss."
             val content = candidates.getJSONObject(0).getJSONObject("content")
             val parts = content.getJSONArray("parts")
+
+            var finalReply = "Command processed, Boss."
+            var handledTool = false
 
             for (i in 0 until parts.length()) {
                 val part = parts.getJSONObject(i)
@@ -42,12 +58,18 @@ object FridayBrain {
                     val fc = part.getJSONObject("functionCall")
                     val name = fc.getString("name")
                     val args = fc.optJSONObject("args") ?: JSONObject()
-                    return@withContext executeTool(context, name, args, apiKey.trim())
+                    finalReply = executeTool(context, name, args, apiKey.trim())
+                    handledTool = true
+                    break
                 }
             }
 
-            val text = parts.getJSONObject(0).optString("text", "Command processed, Boss.")
-            return@withContext text.replace("*", "").trim()
+            if (!handledTool) {
+                finalReply = parts.getJSONObject(0).optString("text", finalReply).replace("*", "").trim()
+            }
+
+            addToHistory("model", finalReply)
+            return@withContext finalReply
         } catch (_: Exception) {
             return@withContext handleOffline(context, userInput, lower)
         }
@@ -70,7 +92,7 @@ object FridayBrain {
             lower.contains("reminder") || lower.contains("કામ") ->
                 PhoneController.getPendingReminders(context)
             else ->
-                "Boss, add your Gemini API Key via the ⚙️ KEY button for smart AI answers, live web search, and natural voice commands!"
+                "Boss, add your Gemini API Key via ⚙️ KEY for smart AI answers and live voice commands!"
         }
     }
 
@@ -153,7 +175,7 @@ object FridayBrain {
         put("description", desc)
     }
 
-    private fun buildToolPayload(userInput: String): JSONObject {
+    private fun buildToolPayload(): JSONObject {
         val decls = JSONArray().apply {
             put(toolDecl("make_call", "Call a contact or phone number.",
                 JSONObject().put("contact_name", prop("STRING", "Name or phone number")), listOf("contact_name")))
@@ -181,13 +203,16 @@ object FridayBrain {
                 JSONObject().put("query", prop("STRING", "Search query")), listOf("query")))
         }
 
+        val contentsArr = JSONArray()
+        synchronized(history) {
+            history.forEach { contentsArr.put(it) }
+        }
+
         return JSONObject().apply {
             put("system_instruction", JSONObject().put("parts", JSONArray().put(
-                JSONObject().put("text", "You are F.R.I.D.A.Y., an intelligent personal Android AI assistant. Call the user 'Boss'. Understand English, Gujarati, and Hindi. Reply concisely in 1-2 sentences in the user's language. Use tools whenever the user wants a phone action or live web info.")
+                JSONObject().put("text", "You are F.R.I.D.A.Y., an intelligent personal Android AI assistant like Siri/Jarvis. Call the user 'Boss'. Understand English, Gujarati, and Hindi. Remember previous turns in the conversation (e.g., if you asked which contact to call and the user replies with the full name, call that contact). Reply concisely in 1-2 sentences.")
             )))
-            put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(
-                JSONObject().put("text", userInput)
-            ))))
+            put("contents", contentsArr)
             put("tools", JSONArray().put(JSONObject().put("function_declarations", decls)))
         }
     }
