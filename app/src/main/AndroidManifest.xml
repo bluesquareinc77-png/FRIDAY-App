@@ -29,6 +29,22 @@
             </intent-filter>
         </activity>
 
+        <!-- Siri Style Assistant Overlay (Works from Power Button / Swipe on Any App) -->
+        <activity
+            android:name=".AssistActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Friday.Overlay">
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VOICE_COMMAND" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
         <receiver
             android:name=".ReminderReceiver"
             android:exported="false" />
