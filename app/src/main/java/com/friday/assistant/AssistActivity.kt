@@ -7,6 +7,7 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.core.animateDpAsState
@@ -28,6 +29,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -35,10 +37,22 @@ class AssistActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var speechRecognizer: SpeechRecognizer? = null
+    private var onTtsComplete: ((String) -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         tts = TextToSpeech(this, this)
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                runOnUiThread { onTtsComplete?.invoke(utteranceId ?: "") }
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                runOnUiThread { onTtsComplete?.invoke(utteranceId ?: "") }
+            }
+        })
+
         if (SpeechRecognizer.isRecognitionAvailable(this)) {
             speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
         }
@@ -46,7 +60,9 @@ class AssistActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         setContent {
             SiriOverlayScreen(
                 speechRecognizer = speechRecognizer,
-                onSpeak = { speakOut(it) },
+                isTtsReady = { ttsReady },
+                onSpeakWithId = { text, id -> speakOut(text, id) },
+                setTtsCallback = { cb -> onTtsComplete = cb },
                 onClose = { finish() }
             )
         }
@@ -56,11 +72,11 @@ class AssistActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         if (status == TextToSpeech.SUCCESS) {
             ttsReady = true
             tts?.setPitch(1.08f)
-            tts?.setSpeechRate(1.02f)
+            tts?.setSpeechRate(1.05f)
         }
     }
 
-    private fun speakOut(text: String) {
+    private fun speakOut(text: String, utteranceId: String) {
         if (!ttsReady) return
         val locale = when {
             Regex("[\\u0A80-\\u0AFF]").containsMatchIn(text) -> Locale("gu", "IN")
@@ -68,7 +84,7 @@ class AssistActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             else -> Locale.UK
         }
         tts?.language = locale
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "friday_assist_tts")
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
     }
 
     override fun onDestroy() {
@@ -82,7 +98,9 @@ class AssistActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 @Composable
 fun SiriOverlayScreen(
     speechRecognizer: SpeechRecognizer?,
-    onSpeak: (String) -> Unit,
+    isTtsReady: () -> Boolean,
+    onSpeakWithId: (String, String) -> Unit,
+    setTtsCallback: ((String) -> Unit) -> Unit,
     onClose: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -96,58 +114,82 @@ fun SiriOverlayScreen(
     var spokenText by remember { mutableStateOf("Listening, Boss...") }
     var replyText by remember { mutableStateOf("") }
 
-    fun startListening() {
+    lateinit var startListening: () -> Unit
+
+    setTtsCallback { id ->
+        when (id) {
+            "followup" -> startListening()
+            "autoclose" -> onClose()
+        }
+    }
+
+    startListening = {
         if (speechRecognizer == null) {
             spokenText = "Speech recognition unavailable on device."
-            return
-        }
-        replyText = ""
-        spokenText = "Listening, Boss..."
-        isListening = true
+        } else {
+            replyText = ""
+            spokenText = "Listening, Boss..."
+            isListening = true
 
-        speechRecognizer.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) { isListening = true }
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {
-                audioLevel = ((rmsdB + 2f) / 10f).coerceIn(0.2f, 1.6f)
-            }
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() { isListening = false }
-            override fun onError(error: Int) {
-                isListening = false
-                audioLevel = 0.2f
-                spokenText = "Tap the orb to speak again, Boss."
-            }
-            override fun onPartialResults(partialResults: Bundle?) {
-                val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                if (!partial.isNullOrBlank()) spokenText = partial
-            }
-            override fun onResults(results: Bundle?) {
-                isListening = false
-                audioLevel = 0.2f
-                val finalCmd = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                if (!finalCmd.isNullOrBlank()) {
-                    spokenText = finalCmd
-                    replyText = "Processing..."
-                    scope.launch {
-                        val res = FridayBrain.process(context, finalCmd, apiKey)
-                        replyText = res
-                        onSpeak(res)
-                    }
-                } else {
-                    spokenText = "Didn't catch that, Boss. Tap to retry."
+            speechRecognizer.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) { isListening = true }
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(rmsdB: Float) {
+                    audioLevel = ((rmsdB + 2f) / 10f).coerceIn(0.2f, 1.6f)
                 }
-            }
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onEndOfSpeech() { isListening = false }
+                override fun onError(error: Int) {
+                    isListening = false
+                    audioLevel = 0.2f
+                    spokenText = "Tap the orb to speak again, Boss."
+                }
+                override fun onPartialResults(partialResults: Bundle?) {
+                    val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                    if (!partial.isNullOrBlank()) spokenText = partial
+                }
+                override fun onResults(results: Bundle?) {
+                    isListening = false
+                    audioLevel = 0.2f
+                    val finalCmd = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                    if (!finalCmd.isNullOrBlank()) {
+                        spokenText = finalCmd
+                        replyText = "Processing..."
+                        scope.launch {
+                            val res = FridayBrain.process(context, finalCmd, apiKey)
+                            replyText = res.reply
+                            val uttId = when {
+                                res.expectFollowUp -> "followup"
+                                res.autoClose -> "autoclose"
+                                else -> "normal"
+                            }
+                            if (isTtsReady()) {
+                                onSpeakWithId(res.reply, uttId)
+                            } else {
+                                if (res.expectFollowUp) {
+                                    delay(1200)
+                                    startListening()
+                                } else if (res.autoClose) {
+                                    delay(1400)
+                                    onClose()
+                                }
+                            }
+                        }
+                    } else {
+                        spokenText = "Didn't catch that, Boss. Tap to retry."
+                    }
+                }
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+            })
 
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, micLang)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, micLang)
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
+            }
+            speechRecognizer.startListening(intent)
         }
-        speechRecognizer.startListening(intent)
     }
 
     LaunchedEffect(Unit) {
@@ -205,7 +247,6 @@ fun SiriOverlayScreen(
 
             Spacer(Modifier.height(18.dp))
 
-            // Siri-Style Animated Glowing Wave Bars + Orb
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
